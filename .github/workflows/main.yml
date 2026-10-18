@@ -30,7 +30,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip autoconf automake libtool pkg-config \
+          sudo apt-get install -y git zip unzip autoconf automake libtool libltdl-dev pkg-config \
             zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
 
       - name: Install Buildozer
@@ -48,7 +48,31 @@ jobs:
           restore-keys: buildozer-
 
       - name: Build APK
-        run: buildozer -v android debug
+        shell: bash
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show real error (only if build failed)
+        if: failure()
+        shell: bash
+        run: |
+          echo "=============== REAL ERROR (copy this part) ==============="
+          n=$(grep -n "Command failed" build.log | head -1 | cut -d: -f1)
+          if [ -n "$n" ]; then
+            start=$((n-70)); [ $start -lt 1 ] && start=1
+            sed -n "${start},${n}p" build.log
+          else
+            tail -n 80 build.log
+          fi
+          echo "=============== END ==============="
+
+      - name: Upload full log (only if build failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
