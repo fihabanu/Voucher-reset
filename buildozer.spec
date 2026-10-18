@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,kv,atlas,json
 source.exclude_dirs = .github, .buildozer, bin, venv, __pycache__
 
 version = 1.0
-requirements = python3,kivy==2.3.0
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0
 
 orientation = portrait
 fullscreen = 0
