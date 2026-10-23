@@ -6,11 +6,12 @@ rebuilt with Kivy widgets so it can be packaged into an Android APK with
 Buildozer. Talks directly to the router over WiFi/LAN - no server needed,
 same as MikHmon.
 
-Run on desktop to test first:  python kivy_voucher_manager.py
+Run on desktop to test first:  python main.py
 Then package for Android with Buildozer (see the README for steps).
 """
 
 import json
+import re
 import os
 import socket
 import struct
@@ -398,9 +399,197 @@ class RouterList(Screen):
         confirm("Confirm", f"Remove router '{app.routers[i]['name']}'?", do_remove)
 
 
+# ----------------------------------------------------------------------
+# Generic helpers for the new screens
+# ----------------------------------------------------------------------
+def fmt_bytes(v):
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return "0 B"
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.2f} {u}"
+        n /= 1024
+
+
+def cmd(api, path, args=None, query=None, proplist=None):
+    """Run one RouterOS command, return list of dicts. Raises RouterOSError on !trap."""
+    words = [path] + [f"={k}={v}" for k, v in (args or {}).items()]
+    if proplist:
+        words.append("=.proplist=" + proplist)
+    words += ["?" + q for q in (query or [])]
+    rows = []
+    for rep, at in api.talk(words):
+        if rep in ("!trap", "!fatal"):
+            raise RouterOSError(f"{path}: {at.get('message', 'failed')}")
+        if rep == "!re" or (rep == "!done" and "ret" in at):
+            rows.append(at)
+    return rows
+
+
+def run_api(router, work, on_ok, on_err):
+    """Connect in a background thread, run work(api), report back on the UI thread."""
+    def runner():
+        api = None
+        try:
+            api = api_connect(router)
+            res = work(api)
+            Clock.schedule_once(lambda dt: on_ok(res))
+        except Exception as e:
+            msg = str(e) or e.__class__.__name__
+            Clock.schedule_once(lambda dt: on_err(msg))
+        finally:
+            if api:
+                api.close()
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def wrapped_label(**kw):
+    """Label that wraps text to its width and grows in height with the text."""
+    lbl = Label(size_hint_y=None, halign="left", valign="top", **kw)
+    lbl.bind(width=lambda *_: setattr(lbl, "text_size", (lbl.width, None)))
+    lbl.bind(texture_size=lambda *_: setattr(lbl, "height", lbl.texture_size[1] + dp(8)))
+    return lbl
+
+
+# ----------------------------------------------------------------------
+# Router operations (same behaviour as the Windows Hotspot Manager "Users" tab)
+# ----------------------------------------------------------------------
+def fetch_dashboard(api):
+    res = (cmd(api, "/system/resource/print") or [{}])[0]
+    ident = (cmd(api, "/system/identity/print") or [{}])[0]
+    clk = (cmd(api, "/system/clock/print") or [{}])[0]
+    users = len(cmd(api, "/ip/hotspot/user/print", proplist=".id"))
+    active = len(cmd(api, "/ip/hotspot/active/print", proplist=".id"))
+    return {"res": res, "ident": ident, "clk": clk, "users": users, "active": active}
+
+
+def dashboard_text(d):
+    res, clk = d["res"], d["clk"]
+    ver = res.get("version", "?")
+    major = "v7" if ver.startswith("7") else ("v6" if ver.startswith("6") else "?")
+    return "\n".join([
+        f"Identity : {d['ident'].get('name', '')}",
+        f"Board : {res.get('board-name', '')}",
+        f"RouterOS : {ver}  ({major})",
+        f"Uptime : {res.get('uptime', '')}",
+        f"CPU load : {res.get('cpu-load', '')}%",
+        f"Clock : {clk.get('date', '')} {clk.get('time', '')}",
+        f"Hotspot users : {d['users']}",
+        f"Active now : {d['active']}",
+    ])
+
+
+def do_check(api, name):
+    found = cmd(api, "/ip/hotspot/user/print", query=["name=" + name])
+    if not found:
+        return f"Voucher '{name}' not found on this router."
+    u = found[0]
+    online = bool(cmd(api, "/ip/hotspot/active/print", query=["user=" + name], proplist=".id"))
+    lines = ["---- Voucher Details ----",
+             f"Name : {u.get('name', '')}",
+             f"Profile : {u.get('profile', '')}",
+             f"MAC Address : {u.get('mac-address') or '(not bound)'}",
+             f"Limit Uptime : {u.get('limit-uptime') or 'unlimited'}",
+             f"Uptime Used : {u.get('uptime', '0s')}",
+             f"Bytes In : {fmt_bytes(u.get('bytes-in', 0))}",
+             f"Bytes Out : {fmt_bytes(u.get('bytes-out', 0))}"]
+    if u.get("limit-bytes-total"):
+        lines.append(f"Data Limit : {fmt_bytes(u['limit-bytes-total'])}")
+    lines += [f"Comment : {u.get('comment', '')}",
+              f"Disabled : {u.get('disabled', 'false')}",
+              f"Online now : {'Yes' if online else 'No'}"]
+    return "\n".join(lines)
+
+
+def reset_voucher(api, voucher):
+    """Clears MAC lock + counters. v6/v7 safe: rename -> add -> remove (rolls back on error)."""
+    log = []
+    found = cmd(api, "/ip/hotspot/user/print", query=["name=" + voucher])
+    if not found:
+        return [f"Voucher '{voucher}' not found."]
+    old = found[0]
+    for act in cmd(api, "/ip/hotspot/active/print", query=["user=" + voucher], proplist=".id"):
+        cmd(api, "/ip/hotspot/active/remove", {".id": act[".id"]})
+        log.append("Active session disconnected.")
+    tmp = voucher + "__reset_tmp"
+    cmd(api, "/ip/hotspot/user/set", {".id": old[".id"], "name": tmp})
+    try:
+        skip = {".id", "uptime", "bytes-in", "bytes-out", "packets-in", "packets-out", "mac-address",
+                "radius", "dynamic", "invalid", ".nextid", "name", "last-seen"}
+        args = {"name": voucher}
+        args.update({k: v for k, v in old.items() if k not in skip and v not in ("", None)})
+        cmd(api, "/ip/hotspot/user/add", args)
+        cmd(api, "/ip/hotspot/user/remove", {".id": old[".id"]})
+        now = cmd(api, "/ip/hotspot/user/print", query=["name=" + voucher])
+        if now and now[0].get("mac-address"):
+            log.append(f"WARNING: MAC still shows as '{now[0]['mac-address']}'.")
+        else:
+            log.append(f"'{voucher}' reset: MAC lock and counters cleared.")
+    except Exception as e:
+        try:
+            cmd(api, "/ip/hotspot/user/set", {".id": old[".id"], "name": voucher})
+            log.append(f"ERROR: {e}")
+            log.append("Original voucher restored untouched, nothing was lost.")
+        except Exception:
+            log.append(f"ERROR: {e}")
+            log.append("Could not auto-restore the original name - please check Winbox.")
+    return log
+
+
+def do_toggle(api, name, disable):
+    found = cmd(api, "/ip/hotspot/user/print", query=["name=" + name], proplist=".id")
+    if not found:
+        return f"Voucher '{name}' not found."
+    cmd(api, "/ip/hotspot/user/set", {".id": found[0][".id"], "disabled": "yes" if disable else "no"})
+    if disable:
+        for act in cmd(api, "/ip/hotspot/active/print", query=["user=" + name], proplist=".id"):
+            cmd(api, "/ip/hotspot/active/remove", {".id": act[".id"]})
+        return f"'{name}' disabled (any active session was disconnected)."
+    return f"'{name}' enabled."
+
+
+def do_remove(api, name):
+    found = cmd(api, "/ip/hotspot/user/print", query=["name=" + name], proplist=".id")
+    if not found:
+        return f"Voucher '{name}' not found."
+    for act in cmd(api, "/ip/hotspot/active/print", query=["user=" + name], proplist=".id"):
+        cmd(api, "/ip/hotspot/active/remove", {".id": act[".id"]})
+    cmd(api, "/ip/hotspot/user/remove", {".id": found[0][".id"]})
+    for s in cmd(api, "/system/scheduler/print", query=["name=" + name], proplist=".id"):
+        cmd(api, "/system/scheduler/remove", {".id": s[".id"]})
+    return f"'{name}' removed."
+
+
+def do_add_user(api, name, password, profile, limit, comment):
+    args = {"name": name, "password": password or name, "profile": profile or "default"}
+    if limit:
+        args["limit-uptime"] = limit
+    if comment:
+        args["comment"] = comment
+    cmd(api, "/ip/hotspot/user/add", args)
+    return args
+
+
+def fetch_profiles(api):
+    rows = cmd(api, "/ip/hotspot/user/profile/print")
+    out = []
+    for r in rows:
+        m = re.search(r"#\s*vm:([^\r\n]*)", r.get("on-login", "") or "")
+        meta = dict(p.split("=", 1) for p in m[1].strip().split(";") if "=" in p) if m else {}
+        out.append({"name": r.get("name", ""), "shared": r.get("shared-users", "1"),
+                    "rate": r.get("rate-limit", ""), "validity": meta.get("validity", "")})
+    return out
+
+
+# ----------------------------------------------------------------------
+# Screens: choose router -> dashboard -> actions
+# ----------------------------------------------------------------------
 class ChooseRouter(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
+        self.names = []
         root = BoxLayout(orientation="vertical", padding=dp(30), spacing=dp(20))
         root.add_widget(Label(text="Choose Router", font_size="20sp",
                                size_hint_y=None, height=dp(50)))
@@ -412,200 +601,301 @@ class ChooseRouter(Screen):
         back.bind(on_release=lambda *_: setattr(self.manager, "current", "main"))
         root.add_widget(cont)
         root.add_widget(back)
+        root.add_widget(Label())  # spacer
         self.add_widget(root)
 
     def on_pre_enter(self):
         app = App.get_running_app()
         app.routers = load_routers()
-        names = [f"{r['name']} ({r['ip']})" for r in app.routers]
-        self.spinner.values = names
-        if names:
-            self.spinner.text = names[0]
+        # only router NAMES are shown (no IP / DNS); duplicates get a number
+        self.names, seen = [], {}
+        for r in app.routers:
+            n = r.get("name", "")
+            seen[n] = seen.get(n, 0) + 1
+            self.names.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+        self.spinner.values = self.names
+        self.spinner.text = self.names[0] if self.names else "Select router"
 
     def go(self, *_):
         app = App.get_running_app()
         if not app.routers:
             alert("No routers", "Please add a router first.")
             return
-        idx = self.spinner.values.index(self.spinner.text) if self.spinner.text in self.spinner.values else -1
-        if idx < 0:
+        if self.spinner.text not in self.names:
             alert("Select", "Please select a router.")
             return
-        app.selected_router = app.routers[idx]
-        self.manager.get_screen("voucher_action").on_pre_enter()
-        self.manager.current = "voucher_action"
+        app.selected_router = app.routers[self.names.index(self.spinner.text)]
+        self.manager.current = "dashboard"
 
 
-class VoucherAction(Screen):
+class Dashboard(Screen):
+    ACTIONS = [("Check Voucher", "check"), ("Reset Voucher", "reset"),
+               ("Add User", "add"), ("Enable Voucher", "enable"),
+               ("Disable Voucher", "disable"), ("Remove Voucher", "remove")]
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.busy = False
-        self.root_box = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(10))
-        self.title_lbl = Label(text="", font_size="18sp", size_hint_y=None, height=dp(40))
-        self.root_box.add_widget(self.title_lbl)
-
-        self.voucher_in = TextInput(hint_text="Voucher / Username", multiline=False,
-                                     size_hint_y=None, height=dp(48))
-        self.root_box.add_widget(self.voucher_in)
-
-        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        check_btn = Button(text="Check Voucher")
-        check_btn.bind(on_release=self.check)
-        reset_btn = Button(text="Reset Voucher")
-        reset_btn.bind(on_release=self.ask_reset)
-        row.add_widget(check_btn)
-        row.add_widget(reset_btn)
-        self.root_box.add_widget(row)
-
-        self.result_lbl = Label(text="", size_hint_y=None, halign="left", valign="top")
-        self.result_lbl.bind(texture_size=lambda *_: setattr(
-            self.result_lbl, "height", self.result_lbl.texture_size[1]))
-        self.result_lbl.bind(width=lambda *_: self.result_lbl.setter("text_size")(
-            self.result_lbl, (self.result_lbl.width, None)))
         scroll = ScrollView()
-        scroll.add_widget(self.result_lbl)
-        self.root_box.add_widget(scroll)
+        col = GridLayout(cols=1, spacing=dp(10), padding=dp(20), size_hint_y=None)
+        col.bind(minimum_height=col.setter("height"))
 
-        back = Button(text="<- Back", size_hint_y=None, height=dp(44))
+        self.name_lbl = Label(text="", font_size="20sp", bold=True, size_hint_y=None, height=dp(36))
+        self.ip_lbl = Label(text="", size_hint_y=None, height=dp(26))
+        self.info = wrapped_label(text="")
+        col.add_widget(self.name_lbl)
+        col.add_widget(self.ip_lbl)
+        col.add_widget(self.info)
+
+        grid = GridLayout(cols=2, spacing=dp(10), size_hint_y=None)
+        grid.bind(minimum_height=grid.setter("height"))
+        for text, mode in self.ACTIONS:
+            b = Button(text=text, size_hint_y=None, height=dp(60))
+            b.bind(on_release=lambda _b, m=mode: self.open_action(m))
+            grid.add_widget(b)
+        col.add_widget(grid)
+
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        refresh = Button(text="Refresh")
+        refresh.bind(on_release=lambda *_: self.refresh())
+        back = Button(text="<- Back")
         back.bind(on_release=lambda *_: setattr(self.manager, "current", "choose_router"))
-        self.root_box.add_widget(back)
-        self.add_widget(self.root_box)
+        row.add_widget(refresh)
+        row.add_widget(back)
+        col.add_widget(row)
+        scroll.add_widget(col)
+        self.add_widget(scroll)
 
     def on_pre_enter(self):
-        app = App.get_running_app()
-        r = app.selected_router
-        self.title_lbl.text = f"Router: {r['name']} ({r['ip']})" if r else ""
+        self.refresh()
+
+    def refresh(self):
+        r = App.get_running_app().selected_router
+        if not r or self.busy:
+            return
+        self.name_lbl.text = r.get("name", "")
+        self.ip_lbl.text = f"IP: {r.get('ip', '')}"
+        self.info.text = "Loading ..."
+        self.busy = True
+        run_api(r, fetch_dashboard, self._ok, self._err)
+
+    def _ok(self, d):
+        self.busy = False
+        self.info.text = dashboard_text(d)
+
+    def _err(self, msg):
+        self.busy = False
+        self.info.text = f"ERROR: {msg}\n\nCheck the IP/port/user/password, then tap Refresh."
+
+    def open_action(self, mode):
+        if mode == "add":
+            self.manager.get_screen("add_user").prepare()
+            self.manager.current = "add_user"
+        else:
+            self.manager.get_screen("user_action").set_mode(mode)
+            self.manager.current = "user_action"
+
+
+class UserAction(Screen):
+    """One screen for: check / reset / enable / disable / remove (type a voucher name)."""
+    MODES = {
+        "check": ("Check Voucher", "Check"),
+        "reset": ("Reset Voucher", "Reset"),
+        "enable": ("Enable Voucher", "Enable"),
+        "disable": ("Disable Voucher", "Disable"),
+        "remove": ("Remove Voucher", "Remove"),
+    }
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.busy = False
+        self.mode = "check"
+        root = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(10))
+        self.title_lbl = Label(text="", font_size="18sp", size_hint_y=None, height=dp(40))
+        root.add_widget(self.title_lbl)
+        self.voucher_in = TextInput(hint_text="Voucher / Username", multiline=False,
+                                     size_hint_y=None, height=dp(48))
+        root.add_widget(self.voucher_in)
+        self.go_btn = Button(text="", size_hint_y=None, height=dp(52))
+        self.go_btn.bind(on_release=self.on_go)
+        root.add_widget(self.go_btn)
+        self.result_lbl = wrapped_label(text="")
+        scroll = ScrollView()
+        scroll.add_widget(self.result_lbl)
+        root.add_widget(scroll)
+        back = Button(text="<- Back", size_hint_y=None, height=dp(44))
+        back.bind(on_release=lambda *_: setattr(self.manager, "current", "dashboard"))
+        root.add_widget(back)
+        self.add_widget(root)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        title, btn = self.MODES[mode]
+        r = App.get_running_app().selected_router or {}
+        self.title_lbl.text = f"{title} - {r.get('name', '')}"
+        self.go_btn.text = btn
         self.voucher_in.text = ""
         self.result_lbl.text = ""
 
-    def log(self, text):
-        # worker thread theke call hole-o safe: UI update main thread-e hoy
-        Clock.schedule_once(lambda dt: self._append(text))
-
-    def _append(self, text):
-        self.result_lbl.text += text + "\n"
-
-    def _finish(self):
-        Clock.schedule_once(lambda dt: setattr(self, "busy", False))
-
-    def check(self, *_):
-        voucher = self.voucher_in.text.strip()
-        if not voucher:
+    def on_go(self, *_):
+        name = self.voucher_in.text.strip()
+        if not name:
             alert("Input needed", "Enter a voucher/username first.")
             return
         if self.busy:
             return
-        self.busy = True
-        self.result_lbl.text = ""
-        r = App.get_running_app().selected_router
-        threading.Thread(target=self._check_worker, args=(voucher, r), daemon=True).start()
+        if self.mode == "reset":
+            confirm("Confirm Reset", f"Reset voucher '{name}'? This clears its MAC lock and "
+                    f"disconnects the current device.", lambda: self.start(name))
+        elif self.mode == "remove":
+            confirm("Confirm Remove", f"Remove voucher '{name}' permanently?",
+                    lambda: self.start(name))
+        else:
+            self.start(name)
 
-    def _check_worker(self, voucher, r):
-        api = None
-        try:
-            self.log(f"Connecting to {r['ip']} ...")
-            api = api_connect(r)
-            res = api.talk(["/ip/hotspot/user/print", "?name=" + voucher])
-            found = [attrs for reply, attrs in res if reply == "!re"]
-            if not found:
-                self.log(f"Voucher '{voucher}' not found on this router.")
-                return
-            attrs = found[0]
-            self.log("---- Voucher Details ----")
-            self.log(f"Name        : {attrs.get('name', '')}")
-            self.log(f"Profile     : {attrs.get('profile', '')}")
-            self.log(f"MAC Address : {attrs.get('mac-address', '(not bound)')}")
-            self.log(f"Limit Uptime: {attrs.get('limit-uptime', 'unlimited')}")
-            self.log(f"Uptime Used : {attrs.get('uptime', '0s')}")
-            self.log(f"Bytes In    : {attrs.get('bytes-in', '0')}")
-            self.log(f"Bytes Out   : {attrs.get('bytes-out', '0')}")
-            self.log(f"Disabled    : {attrs.get('disabled', 'false')}")
-        except Exception as e:
-            self.log(f"ERROR: {e}")
-        finally:
-            if api:
-                api.close()
-            self._finish()
-
-    def ask_reset(self, *_):
-        voucher = self.voucher_in.text.strip()
-        if not voucher:
-            alert("Input needed", "Enter a voucher/username first.")
-            return
-        confirm("Confirm Reset",
-                f"Reset voucher '{voucher}'? This clears its MAC lock and "
-                f"disconnects the current device.",
-                self.reset)
-
-    def reset(self):
-        voucher = self.voucher_in.text.strip()
+    def start(self, name):
         if self.busy:
             return
         self.busy = True
-        self.result_lbl.text = ""
+        self.result_lbl.text = "Working ..."
         r = App.get_running_app().selected_router
-        threading.Thread(target=self._reset_worker, args=(voucher, r), daemon=True).start()
+        mode = self.mode
+        if mode == "check":
+            work = lambda api: do_check(api, name)
+        elif mode == "reset":
+            work = lambda api: "\n".join(reset_voucher(api, name))
+        elif mode == "enable":
+            work = lambda api: do_toggle(api, name, False)
+        elif mode == "disable":
+            work = lambda api: do_toggle(api, name, True)
+        else:
+            work = lambda api: do_remove(api, name)
+        run_api(r, work, self._ok, self._err)
 
-    def _reset_worker(self, voucher, r):
-        api = None
-        temp_id = None
-        try:
-            self.log(f"Connecting to {r['ip']} ...")
-            api = api_connect(r)
-            res = api.talk(["/ip/hotspot/user/print", "?name=" + voucher])
-            found = [attrs for reply, attrs in res if reply == "!re"]
-            if not found:
-                self.log(f"Voucher '{voucher}' not found on this router.")
-                return
-            old = found[0]
-            user_id = old.get(".id")
+    def _ok(self, text):
+        self.busy = False
+        self.result_lbl.text = text
 
-            active = api.talk(["/ip/hotspot/active/print", "?user=" + voucher])
-            for reply, attrs in active:
-                if reply == "!re" and ".id" in attrs:
-                    res_k = api.talk(["/ip/hotspot/active/remove", "=.id=" + attrs[".id"]])
-                    check_trap(res_k, "Disconnecting active session")
-                    self.log("Active session disconnected.")
+    def _err(self, msg):
+        self.busy = False
+        self.result_lbl.text = f"ERROR: {msg}"
 
-            temp_name = voucher + "__reset_tmp"
-            res_rn = api.talk(["/ip/hotspot/user/set", "=.id=" + user_id, "=name=" + temp_name])
-            check_trap(res_rn, "Preparing voucher for reset")
-            temp_id = user_id
 
-            exclude = {".id", "uptime", "bytes-in", "bytes-out", "packets-in",
-                       "packets-out", "mac-address", "radius", "dynamic",
-                       "invalid", ".nextid", "name"}
-            new_params = ["=name=" + voucher] + [
-                "=" + k + "=" + v for k, v in old.items()
-                if k not in exclude and v not in ("", None)
-            ]
+class AddUser(Screen):
+    """Create ONE user at a time: username, password, profile (with shared users), limit, comment."""
 
-            res_add = api.talk(["/ip/hotspot/user/add"] + new_params)
-            check_trap(res_add, "Re-creating voucher without MAC lock")
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.busy = False
+        self.profiles = {}
+        scroll = ScrollView()
+        col = GridLayout(cols=1, spacing=dp(10), padding=dp(20), size_hint_y=None)
+        col.bind(minimum_height=col.setter("height"))
+        self.title_lbl = Label(text="Add User", font_size="18sp", size_hint_y=None, height=dp(40))
+        col.add_widget(self.title_lbl)
 
-            res_rm = api.talk(["/ip/hotspot/user/remove", "=.id=" + temp_id])
-            check_trap(res_rm, "Removing old voucher copy")
-            temp_id = None
+        def field(label, **kw2):
+            col.add_widget(Label(text=label, size_hint_y=None, height=dp(22), halign="left",
+                                 text_size=(Window.width - dp(40), None)))
+            w = TextInput(multiline=False, size_hint_y=None, height=dp(46), **kw2)
+            col.add_widget(w)
+            return w
 
-            verify = api.talk(["/ip/hotspot/user/print", "?name=" + voucher])
-            verify_attrs = next((a for rr, at in verify if rr == "!re" for a in [at]), {})
-            new_mac = verify_attrs.get("mac-address", "")
-            if new_mac:
-                self.log(f"WARNING: MAC still shows as '{new_mac}'.")
-            else:
-                self.log(f"Confirmed: voucher '{voucher}' now has no MAC lock — usable on any device.")
-        except Exception as e:
-            self.log(f"ERROR: {e}")
-            if temp_id and api:
-                try:
-                    api.talk(["/ip/hotspot/user/set", "=.id=" + temp_id, "=name=" + voucher])
-                    self.log("Rolled back: original voucher restored untouched, nothing was lost.")
-                except Exception:
-                    self.log("Could not auto-restore the original name - please check Winbox.")
-        finally:
-            if api:
-                api.close()
-            self._finish()
+        self.name_in = field("Username")
+        self.pw_in = field("Password (blank = same as username)")
+        col.add_widget(Label(text="Profile", size_hint_y=None, height=dp(22), halign="left",
+                             text_size=(Window.width - dp(40), None)))
+        self.prof = Spinner(text="Loading profiles ...", size_hint_y=None, height=dp(46))
+        self.prof.bind(text=self.on_profile)
+        col.add_widget(self.prof)
+        self.prof_info = wrapped_label(text="")
+        col.add_widget(self.prof_info)
+        self.limit_in = field("Limit uptime (e.g. 1h, 3d - blank = none)")
+        self.comment_in = field("Comment (optional)")
+
+        self.create_btn = Button(text="Create User", size_hint_y=None, height=dp(54))
+        self.create_btn.bind(on_release=self.create)
+        col.add_widget(self.create_btn)
+        self.result_lbl = wrapped_label(text="")
+        col.add_widget(self.result_lbl)
+        back = Button(text="<- Back", size_hint_y=None, height=dp(44))
+        back.bind(on_release=lambda *_: setattr(self.manager, "current", "dashboard"))
+        col.add_widget(back)
+        scroll.add_widget(col)
+        self.add_widget(scroll)
+
+    def label_for(self, p):
+        return f"{p['name']}  (shared: {p['shared']})"
+
+    def prepare(self):
+        r = App.get_running_app().selected_router or {}
+        self.title_lbl.text = f"Add User - {r.get('name', '')}"
+        for w in (self.name_in, self.pw_in, self.limit_in, self.comment_in):
+            w.text = ""
+        self.result_lbl.text = ""
+        self.prof_info.text = ""
+        self.prof.text = "Loading profiles ..."
+        self.prof.values = []
+        self.profiles = {}
+        run_api(r, fetch_profiles, self._profiles_ok, self._profiles_err)
+
+    def _profiles_ok(self, rows):
+        self.profiles = {self.label_for(p): p for p in rows}
+        self.prof.values = list(self.profiles)
+        if self.profiles:
+            pick = next((k for k, p in self.profiles.items() if p["name"] == "default"),
+                        next(iter(self.profiles)))
+            self.prof.text = pick
+        else:
+            self.prof.text = "default"
+
+    def _profiles_err(self, msg):
+        self.prof.text = "default"
+        self.prof_info.text = f"Could not load profiles: {msg}"
+
+    def on_profile(self, _spinner, text):
+        p = self.profiles.get(text)
+        if not p:
+            self.prof_info.text = ""
+            return
+        parts = [f"Shared users: {p['shared']}"]
+        if p["rate"]:
+            parts.append(f"Rate: {p['rate']}")
+        if p["validity"]:
+            parts.append(f"Validity: {p['validity']}")
+        self.prof_info.text = "   |   ".join(parts)
+
+    def create(self, *_):
+        name = self.name_in.text.strip()
+        if not name:
+            alert("Input needed", "Enter a username.")
+            return
+        if self.busy:
+            return
+        p = self.profiles.get(self.prof.text)
+        profile = p["name"] if p else "default"
+        pw, limit, comment = self.pw_in.text.strip(), self.limit_in.text.strip(), self.comment_in.text.strip()
+        self.busy = True
+        self.result_lbl.text = "Working ..."
+        r = App.get_running_app().selected_router
+        run_api(r, lambda api: do_add_user(api, name, pw, profile, limit, comment),
+                self._ok, self._err)
+
+    def _ok(self, args):
+        self.busy = False
+        lines = ["User created:", f"Username : {args['name']}", f"Password : {args['password']}",
+                 f"Profile : {args['profile']}"]
+        if args.get("limit-uptime"):
+            lines.append(f"Limit uptime : {args['limit-uptime']}")
+        if args.get("comment"):
+            lines.append(f"Comment : {args['comment']}")
+        self.result_lbl.text = "\n".join(lines)
+        self.name_in.text = ""
+        self.pw_in.text = ""
+
+    def _err(self, msg):
+        self.busy = False
+        self.result_lbl.text = f"ERROR: {msg}"
 
 
 class VoucherManagerApp(App):
@@ -618,20 +908,24 @@ class VoucherManagerApp(App):
         sm.add_widget(AddRouterForm(name="add_router"))
         sm.add_widget(RouterList(name="router_list"))
         sm.add_widget(ChooseRouter(name="choose_router"))
-        sm.add_widget(VoucherAction(name="voucher_action"))
+        sm.add_widget(Dashboard(name="dashboard"))
+        sm.add_widget(UserAction(name="user_action"))
+        sm.add_widget(AddUser(name="add_user"))
         self.sm = sm
         Window.bind(on_keyboard=self.on_back_key)
         return sm
 
     def on_back_key(self, window, key, *args):
-        # Android back button (key 27): ager screen-e jao, main-e hole app close
+        # Android back button (key 27): go to the previous screen; on main screen the app closes
         if key == 27:
             back_map = {
                 "manage_menu": "main",
                 "choose_router": "main",
                 "add_router": "manage_menu",
                 "router_list": "manage_menu",
-                "voucher_action": "choose_router",
+                "dashboard": "choose_router",
+                "user_action": "dashboard",
+                "add_user": "dashboard",
             }
             cur = self.sm.current
             if cur in back_map:
